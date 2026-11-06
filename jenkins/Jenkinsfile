@@ -40,7 +40,7 @@ pipeline {
                     docker version
                     docker buildx version
                     kubectl version --client
-                    sonar-scanner --version
+                    sudo sonar-scanner --version
                     curl --fail --silent --show-error "$SONAR_HOST_URL/api/system/status"
                 '''
             }
@@ -66,7 +66,7 @@ pipeline {
                     dir("${APP_DIR}/vote") {
                         sh '''
                             set -e
-                            sonar-scanner \
+                            sudo sonar-scanner \
                               -Dsonar.projectKey=voting-app-vote \
                               -Dsonar.projectName="Voting App - Vote" \
                               -Dsonar.sources=. \
@@ -84,7 +84,7 @@ pipeline {
                     dir("${APP_DIR}/result") {
                         sh '''
                             set -e
-                            sonar-scanner \
+                            sudo sonar-scanner \
                               -Dsonar.projectKey=voting-app-result \
                               -Dsonar.projectName="Voting App - Result" \
                               -Dsonar.sources=. \
