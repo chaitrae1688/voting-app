@@ -44,43 +44,7 @@ pipeline {
                 '''
             }
         }
-        stage('Build and Push ARM64 Images') {
-    steps {
-        sh '''
-            set -eu
-
-            docker build --platform linux/arm64 \
-              -t "$VOTE_IMAGE" app/vote
-
-            docker build --platform linux/arm64 \
-              -t "$RESULT_IMAGE" app/result
-
-            docker build --platform linux/arm64 \
-              -t "$WORKER_IMAGE" app/worker
-
-            docker push "$VOTE_IMAGE"
-            docker push "$RESULT_IMAGE"
-            docker push "$WORKER_IMAGE"
-
-            docker images | grep votingapp
-        '''
-    }
-}
-        stage('Checkout Application') {
-            steps {
-                dir("${APP_DIR}") {
-                    git branch: "${params.APP_BRANCH}", url: "${params.APP_SOURCE_REPO}"
-                }
-                sh '''
-                    set -e
-                    for component in vote result worker; do
-                      test -f "$APP_DIR/$component/Dockerfile" || {
-                        echo "Missing $APP_DIR/$component/Dockerfile"; exit 1;
-                      }
-                    done
-                '''
-            }
-        }
+        
         stage('Prepare ECR') {
             steps {
                 script {
@@ -104,6 +68,43 @@ pipeline {
                     done
                     aws ecr get-login-password --region "$AWS_REGION" |
                       docker login --username AWS --password-stdin "$ECR_REGISTRY"
+                '''
+            }
+        }
+        stage('Build and Push ARM64 Images') {
+            steps {
+                sh '''
+                    set -eu
+
+                    docker build --platform linux/arm64 \
+                    -t "$VOTE_IMAGE" app/vote
+
+                    docker build --platform linux/arm64 \
+                    -t "$RESULT_IMAGE" app/result
+
+                    docker build --platform linux/arm64 \
+                    -t "$WORKER_IMAGE" app/worker
+
+                    docker push "$VOTE_IMAGE"
+                    docker push "$RESULT_IMAGE"
+                    docker push "$WORKER_IMAGE"
+
+                    docker images | grep votingapp
+                '''
+            }
+        }
+        stage('Checkout Application') {
+            steps {
+                dir("${APP_DIR}") {
+                    git branch: "${params.APP_BRANCH}", url: "${params.APP_SOURCE_REPO}"
+                }
+                sh '''
+                    set -e
+                    for component in vote result worker; do
+                      test -f "$APP_DIR/$component/Dockerfile" || {
+                        echo "Missing $APP_DIR/$component/Dockerfile"; exit 1;
+                      }
+                    done
                 '''
             }
         }
