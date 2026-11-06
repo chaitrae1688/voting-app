@@ -36,6 +36,7 @@ pipeline {
                     for tool in aws docker kubectl git; do
                       command -v "$tool" >/dev/null || { echo "Missing tool: $tool"; exit 1; }
                     done
+                    aws sts get-caller-identity
                     docker version
                     docker buildx version
                     kubectl version --client
