@@ -44,6 +44,34 @@ pipeline {
                 '''
             }
         }
+        stage('Build ARM64 images') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Building ARM64 application images"
+
+                    docker build \
+                      --platform linux/arm64 \
+                      -t voting-vote:$IMAGE_TAG \
+                      app/vote
+
+                    docker build \
+                      --platform linux/arm64 \
+                      -t voting-result:$IMAGE_TAG \
+                      app/result
+
+                    docker build \
+                      --platform linux/arm64 \
+                      -t voting-worker:$IMAGE_TAG \
+                      app/worker
+
+                    echo "Docker image builds completed"
+
+                    docker images | grep voting-
+                '''
+            }
+        }
         stage('Checkout Application') {
             steps {
                 dir("${APP_DIR}") {
