@@ -13,96 +13,118 @@ pipeline {
         string(
             name: 'APP_SOURCE_REPO',
             defaultValue: 'https://github.com/chaitrae1688/voting-app.git',
-            description: 'Application repository'
+            description: 'Git repository containing vote, result and worker application source'
         )
-
         string(
             name: 'APP_BRANCH',
             defaultValue: 'main',
-            description: 'Application branch'
+            description: 'Application source branch'
         )
-
         booleanParam(
             name: 'DEPLOY_TO_EKS',
             defaultValue: true,
-            description: 'Deploy to existing EKS cluster'
+            description: 'Deploy application to EKS'
         )
     }
 
     environment {
-        AWS_REGION = 'ap-south-1'
+        AWS_REGION       = 'ap-south-1'
         EKS_CLUSTER_NAME = 'k8s'
-        ECR_PREFIX = 'votingapp'
-        K8S_NAMESPACE = 'votingapp'
+        ECR_PREFIX       = 'votingapp'
+        K8S_NAMESPACE    = 'votingapp'
+        APP_DIR          = 'app'
+        KUBECONFIG       = "${WORKSPACE}/.kube/eks-config"
+        SONAR_HOST_URL   = 'http://3.108.217.137:9000'
 
-        SONAR_HOST_URL = 'http://3.108.217.137:9000'
-
-        DB_PASSWORD_CREDENTIAL = 'postgres-db-password'
-
-        APP_DIR = 'app'
-        KUBECONFIG = "${WORKSPACE}/.kube/eks-config"
+        // Keep these in sync with your Kubernetes manifests.
+        DB_SECRET_NAME   = 'postgres-secret'
+        DB_SECRET_KEY    = 'POSTGRES_PASSWORD'
     }
 
     stages {
 
         stage('Checkout Pipeline Repository') {
             steps {
-                git branch: 'main',
-                    url: 'https://github.com/chaitrae1688/voting-app.git'
-            }
-        }
+                checkout scm
 
-        stage('Preflight') {
-            steps {
                 sh '''
-                    set -e
-
-                    for tool in aws docker kubectl git curl; do
-                        command -v "$tool" >/dev/null || {
-                            echo "Missing tool: $tool"
-                            exit 1
-                        }
-                    done
-
-                    echo "Checking AWS identity"
-                    aws sts get-caller-identity
-
-                    echo "Checking Docker"
-                    docker version
-                    docker buildx version
-
-                    echo "Checking Kubernetes"
-                    kubectl version --client
-
-                    echo "Checking SonarQube"
-                    curl --fail --silent --show-error \
-                        "$SONAR_HOST_URL/api/system/status"
+                    echo "Pipeline repository:"
+                    pwd
+                    ls -la
                 '''
             }
         }
 
-        // CHECKOUT APPLICATION BEFORE DOCKER BUILD
+        stage('Preflight Checks') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Checking required tools..."
+
+                    command -v aws
+                    command -v docker
+                    command -v kubectl
+                    command -v git
+                    command -v curl
+
+                    echo "AWS identity:"
+                    aws sts get-caller-identity
+
+                    echo "Docker version:"
+                    docker version
+
+                    echo "kubectl version:"
+                    kubectl version --client
+
+                    echo "Checking SonarQube..."
+                    curl --fail --silent \
+                        "${SONAR_HOST_URL}/api/system/status"
+                    
+                    echo
+                    echo "Preflight checks completed."
+                '''
+            }
+        }
 
         stage('Checkout Application') {
             steps {
                 dir("${APP_DIR}") {
-                    git branch: "${params.APP_BRANCH}",
-                        url: "${params.APP_SOURCE_REPO}"
+                    deleteDir()
+
+                    git branch: "${APP_BRANCH}",
+                        url: "${APP_SOURCE_REPO}"
                 }
 
                 sh '''
-                    set -e
+                    set -eu
 
-                    echo "Checking application directories"
+                    echo "Application files:"
+                    find app -maxdepth 3 -type f | sort
 
-                    for component in vote result worker; do
-                        test -f "$APP_DIR/$component/Dockerfile" || {
-                            echo "Missing Dockerfile: $APP_DIR/$component/Dockerfile"
+                    for component in vote result worker
+                    do
+                        if [ ! -f "app/${component}/Dockerfile" ]; then
+                            echo "ERROR: Missing app/${component}/Dockerfile"
                             exit 1
-                        }
+                        fi
                     done
 
-                    echo "Application checkout successful"
+                    # Verify the expected application entry-point files.
+                    for file in \
+                        app/vote/app.py \
+                        app/result/package.json \
+                        app/result/server.js \
+                        app/worker/package.json \
+                        app/worker/worker.js
+                    do
+                        if [ ! -f "$file" ]; then
+                            echo "ERROR: Missing application source file: $file"
+                            exit 1
+                        fi
+                    done
+
+                    echo "Application source validation successful."
                 '''
             }
         }
@@ -111,7 +133,7 @@ pipeline {
             steps {
                 script {
                     env.AWS_ACCOUNT_ID = sh(
-                        script: "aws sts get-caller-identity --query Account --output text",
+                        script: 'aws sts get-caller-identity --query Account --output text',
                         returnStdout: true
                     ).trim()
 
@@ -119,154 +141,117 @@ pipeline {
                         "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
 
                     env.IMAGE_TAG = "build-${env.BUILD_NUMBER}"
-
-                    env.VOTE_IMAGE =
-                        "${env.ECR_REGISTRY}/${env.ECR_PREFIX}-vote:${env.IMAGE_TAG}"
-
-                    env.RESULT_IMAGE =
-                        "${env.ECR_REGISTRY}/${env.ECR_PREFIX}-result:${env.IMAGE_TAG}"
-
-                    env.WORKER_IMAGE =
-                        "${env.ECR_REGISTRY}/${env.ECR_PREFIX}-worker:${env.IMAGE_TAG}"
                 }
 
                 sh '''
-                    set -e
+                    set -eu
 
-                    for component in vote result worker; do
+                    echo "Logging in to ECR..."
 
-                        repository="${ECR_PREFIX}_${component}"
+                    aws ecr get-login-password \
+                        --region "$AWS_REGION" |
+                    docker login \
+                        --username AWS \
+                        --password-stdin "$ECR_REGISTRY"
+
+                    for component in vote result worker
+                    do
+                        repository="${ECR_PREFIX}-${component}"
 
                         if ! aws ecr describe-repositories \
                             --repository-names "$repository" \
-                            --region "$AWS_REGION" >/dev/null 2>&1; then
-
+                            --region "$AWS_REGION" >/dev/null 2>&1
+                        then
                             aws ecr create-repository \
                                 --repository-name "$repository" \
-                                --region "$AWS_REGION" \
-                                --image-scanning-configuration scanOnPush=true
+                                --region "$AWS_REGION"
                         fi
                     done
 
-                    echo "Logging in to ECR"
-
-                    aws ecr get-login-password --region "$AWS_REGION" |
-                        docker login \
-                        --username AWS \
-                        --password-stdin "$ECR_REGISTRY"
+                    echo "ECR repositories are ready."
                 '''
             }
         }
 
-        stage('Build and Push Multi-Architecture Images') {
+        stage('Build and Push Docker Images') {
             steps {
                 sh '''
                     set -eu
 
-                    echo "Creating Docker Buildx builder"
-
-                    if ! docker buildx inspect votingapp-builder >/dev/null 2>&1; then
-                        docker buildx create \
-                            --name votingapp-builder \
-                            --driver docker-container
-                    fi
-
+                    docker buildx create \
+                        --name votingapp-builder \
+                        --driver docker-container \
+                        --use 2>/dev/null || \
                     docker buildx use votingapp-builder
 
                     docker buildx inspect --bootstrap
 
-                    echo "Registering QEMU handlers"
+                    for component in vote result worker
+                    do
+                        echo "Building ${component} image..."
 
-                    docker run --privileged --rm \
-                        tonistiigi/binfmt --install arm64,amd64
+                        docker buildx build \
+                            --platform linux/amd64 \
+                            --file "app/${component}/Dockerfile" \
+                            --tag "${ECR_REGISTRY}/${ECR_PREFIX}-${component}:${IMAGE_TAG}" \
+                            --push \
+                            "app/${component}"
+                    done
 
-                    echo "Building VOTE image"
-
-                    docker buildx build \
-                        --platform linux/amd64,linux/arm64 \
-                        --push \
-                        --tag "$VOTE_IMAGE" \
-                        "$APP_DIR/vote"
-
-                    echo "Building RESULT image"
-
-                    docker buildx build \
-                        --platform linux/amd64,linux/arm64 \
-                        --push \
-                        --tag "$RESULT_IMAGE" \
-                        "$APP_DIR/result"
-
-                    echo "Building WORKER image"
-
-                    docker buildx build \
-                        --platform linux/amd64,linux/arm64 \
-                        --push \
-                        --tag "$WORKER_IMAGE" \
-                        "$APP_DIR/worker"
-
-                    echo "Verifying pushed images"
-
-                    docker buildx imagetools inspect "$VOTE_IMAGE"
-                    docker buildx imagetools inspect "$RESULT_IMAGE"
-                    docker buildx imagetools inspect "$WORKER_IMAGE"
+                    echo "All images pushed successfully."
                 '''
             }
         }
 
-        stage('Configure EKS Access') {
+        stage('Configure EKS') {
             when {
                 expression { params.DEPLOY_TO_EKS }
             }
-
             steps {
                 sh '''
-                    set -e
+                    set -eu
 
                     mkdir -p "$(dirname "$KUBECONFIG")"
-
-                    aws eks describe-cluster \
-                        --region "$AWS_REGION" \
-                        --name "$EKS_CLUSTER_NAME" \
-                        --query 'cluster.{name:name,status:status,version:version}' \
-                        --output table
 
                     aws eks update-kubeconfig \
                         --region "$AWS_REGION" \
                         --name "$EKS_CLUSTER_NAME" \
                         --kubeconfig "$KUBECONFIG"
 
-                    kubectl config current-context
+                    kubectl --kubeconfig "$KUBECONFIG" \
+                        get nodes
 
-                    kubectl get nodes -o wide
+                    echo "EKS connection successful."
                 '''
             }
         }
 
-        stage('Create Namespace and DB Secret') {
+        stage('Create Namespace and Database Secret') {
             when {
                 expression { params.DEPLOY_TO_EKS }
             }
-
             steps {
-                sh '''
-                    kubectl apply -f kubernetes/eks/00-namespace.yaml
-                '''
-
                 withCredentials([
                     string(
-                        credentialsId: "${DB_PASSWORD_CREDENTIAL}",
-                        variable: 'POSTGRES_PASSWORD'
+                        credentialsId: 'postgres-db-password',
+                        variable: 'DB_PASSWORD'
                     )
                 ]) {
                     sh '''
-                        set +x
+                        set -eu
 
-                        kubectl create secret generic db-credentials \
+                        kubectl --kubeconfig "$KUBECONFIG" \
+                            apply -f kubernetes/eks/00-namespace.yaml
+
+                        kubectl --kubeconfig "$KUBECONFIG" \
+                            create secret generic "$DB_SECRET_NAME" \
                             --namespace "$K8S_NAMESPACE" \
-                            --from-literal=POSTGRES_USER=postgres \
-                            --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+                            --from-literal="${DB_SECRET_KEY}=${DB_PASSWORD}" \
                             --dry-run=client -o yaml |
-                            kubectl apply -f -
+                        kubectl --kubeconfig "$KUBECONFIG" \
+                            apply -f -
+
+                        echo "Namespace and database secret are ready."
                     '''
                 }
             }
@@ -276,69 +261,76 @@ pipeline {
             when {
                 expression { params.DEPLOY_TO_EKS }
             }
-
             steps {
                 sh '''
-                    set -e
+                    set -eu
 
-                    echo "Deploying PostgreSQL"
-                    kubectl apply -f kubernetes/eks/01-postgres.yaml
+                    echo "Applying Kubernetes manifests..."
 
-                    echo "Deploying Redis"
-                    kubectl apply -f kubernetes/eks/02-redis.yaml
+                    for manifest in \
+                        01-postgres.yaml \
+                        02-redis.yaml \
+                        03-vote.yaml \
+                        04-result.yaml \
+                        05-worker.yaml
+                    do
+                        kubectl --kubeconfig "$KUBECONFIG" \
+                            apply -f "kubernetes/eks/$manifest" \
+                            --namespace "$K8S_NAMESPACE"
+                    done
 
-                    echo "Deploying Vote"
-                    kubectl apply -f kubernetes/eks/03-vote.yaml
+                    echo "Updating application images..."
 
-                    echo "Deploying Result"
-                    kubectl apply -f kubernetes/eks/04-result.yaml
-
-                    echo "Deploying Worker"
-                    kubectl apply -f kubernetes/eks/05-worker.yaml
-
-                    echo "Updating application images"
-
-                    kubectl set image deployment/voting-app-deploy \
-                        vote="$VOTE_IMAGE" \
+                    kubectl --kubeconfig "$KUBECONFIG" \
+                        set image deployment/voting-app-deploy \
+                        vote="${ECR_REGISTRY}/${ECR_PREFIX}-vote:${IMAGE_TAG}" \
                         -n "$K8S_NAMESPACE"
 
-                    kubectl set image deployment/result-app-deploy \
-                        result="$RESULT_IMAGE" \
+                    kubectl --kubeconfig "$KUBECONFIG" \
+                        set image deployment/result-app-deploy \
+                        result="${ECR_REGISTRY}/${ECR_PREFIX}-result:${IMAGE_TAG}" \
                         -n "$K8S_NAMESPACE"
 
-                    kubectl set image deployment/worker-deploy \
-                        worker="$WORKER_IMAGE" \
+                    kubectl --kubeconfig "$KUBECONFIG" \
+                        set image deployment/worker-deploy \
+                        worker="${ECR_REGISTRY}/${ECR_PREFIX}-worker:${IMAGE_TAG}" \
                         -n "$K8S_NAMESPACE"
+
+                    echo "Deployment manifests applied."
                 '''
             }
         }
 
-        stage('Verify Rollouts') {
+        stage('Verify Deployment') {
             when {
                 expression { params.DEPLOY_TO_EKS }
             }
-
             steps {
                 sh '''
-                    set -e
+                    set -eu
 
                     for deployment in \
                         postgres-deploy \
                         redis-deploy \
                         voting-app-deploy \
                         result-app-deploy \
-                        worker-deploy; do
+                        worker-deploy
+                    do
+                        echo "Checking ${deployment}..."
 
-                        kubectl rollout status \
-                            "deployment/$deployment" \
-                            -n "$K8S_NAMESPACE" \
+                        kubectl --kubeconfig "$KUBECONFIG" \
+                            rollout status "deployment/${deployment}" \
+                            --namespace "$K8S_NAMESPACE" \
                             --timeout=300s
                     done
 
-                    echo "Final deployment status"
+                    echo "Pods:"
+                    kubectl --kubeconfig "$KUBECONFIG" \
+                        get pods -n "$K8S_NAMESPACE"
 
-                    kubectl get deployments,pods,services \
-                        -n "$K8S_NAMESPACE" -o wide
+                    echo "Services:"
+                    kubectl --kubeconfig "$KUBECONFIG" \
+                        get services -n "$K8S_NAMESPACE"
                 '''
             }
         }
@@ -346,21 +338,16 @@ pipeline {
 
     post {
         success {
-            echo 'Docker images published and EKS deployment completed successfully.'
+            echo 'Voting App pipeline completed successfully.'
+            echo "Image tag: ${env.IMAGE_TAG}"
         }
 
         failure {
-            echo 'Pipeline failed. Check the first failed stage in Console Output.'
+            echo 'Voting App pipeline failed. Check the failed stage and console output.'
         }
 
         always {
-            sh '''
-                if [ -n "${ECR_REGISTRY:-}" ]; then
-                    docker logout "$ECR_REGISTRY" >/dev/null 2>&1 || true
-                fi
-            '''
-
-            echo "Build ${BUILD_NUMBER}: ${currentBuild.currentResult}"
+            echo 'Pipeline execution finished.'
         }
     }
 }
